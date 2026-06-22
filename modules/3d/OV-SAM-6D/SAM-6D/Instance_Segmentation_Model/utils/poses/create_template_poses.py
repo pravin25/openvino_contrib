@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 # blenderproc run poses/create_template_poses.py
 import blenderproc
 import bpy

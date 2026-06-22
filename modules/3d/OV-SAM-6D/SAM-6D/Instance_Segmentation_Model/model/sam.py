@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 from segment_anything import (
     sam_model_registry,
     SamPredictor,

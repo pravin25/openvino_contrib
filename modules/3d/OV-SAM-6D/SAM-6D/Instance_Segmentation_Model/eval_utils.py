@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 """
 Utilites for mAP @ IoU[0.50:0.95] evaluation
 """

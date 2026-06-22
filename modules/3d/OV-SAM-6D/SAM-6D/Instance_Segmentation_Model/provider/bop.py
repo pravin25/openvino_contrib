@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 import logging, os
 import os.path as osp
 from tqdm import tqdm

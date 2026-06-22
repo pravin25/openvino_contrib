@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 root_dir: ${machine.root_dir}/BOP/
 source_url: https://bop.felk.cvut.cz/media/data/bop_datasets/
 unzip_mode: unzip

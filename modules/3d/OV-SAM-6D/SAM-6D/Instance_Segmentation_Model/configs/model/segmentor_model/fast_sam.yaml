@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 _target_: model.fast_sam.FastSAM
 checkpoint_path: ./checkpoints/FastSAM/FastSAM-x.pt
 segmentor_width_size: ${model.segmentor_width_size}

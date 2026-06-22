@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 import numpy as np
 # credit: https://github.com/ziruiw-dev/farthest-point-sampling/blob/master/fps_v1.py
 

@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T

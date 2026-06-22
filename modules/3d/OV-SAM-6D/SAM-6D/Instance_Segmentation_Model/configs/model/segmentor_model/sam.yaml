@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 _target_: model.sam.CustomSamAutomaticMaskGenerator
 points_per_batch: 64
 stability_score_thresh: 0.85

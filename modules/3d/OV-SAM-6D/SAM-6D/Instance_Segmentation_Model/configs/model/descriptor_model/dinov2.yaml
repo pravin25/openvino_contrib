@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
   _target_: model.dinov2.CustomDINOv2
   model_name: dinov2_vitl14
   # model: 

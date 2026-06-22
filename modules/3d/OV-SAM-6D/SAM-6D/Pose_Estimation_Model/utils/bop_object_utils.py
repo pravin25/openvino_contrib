@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 '''
 Modified from https://github.com/rasmushaugaard/surfemb/blob/master/surfemb/data/obj.py

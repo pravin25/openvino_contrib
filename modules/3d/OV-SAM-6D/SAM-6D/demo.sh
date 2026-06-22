@@ -1,3 +1,6 @@
+#!/bin/bash
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 # Render CAD templates
 cd Render
 blenderproc run render_custom_templates.py --output_dir $OUTPUT_DIR --cad_path $CAD_PATH #--colorize True 

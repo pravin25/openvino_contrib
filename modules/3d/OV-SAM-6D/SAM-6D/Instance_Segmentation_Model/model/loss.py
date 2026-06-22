@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 from torch import nn
 import torch
 from utils.poses.pose_utils import load_rotation_transform, convert_openCV_to_openGL_torch
