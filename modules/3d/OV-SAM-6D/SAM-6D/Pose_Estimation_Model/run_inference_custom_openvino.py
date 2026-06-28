@@ -205,6 +205,10 @@ def get_parser():
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed for deterministic template/model/observed point sampling "
                              "(default: rd_seed from config)")
+    parser.add_argument("--n_hypotheses", type=int, default=1,
+                        help="Number of independent sampling+pose hypotheses to run; "
+                             "the highest model-scored pose is kept per instance. "
+                             "Mitigates sampling-dependent pose-flip ambiguity (default: 1)")
     parser.add_argument("--skip_vsd", action="store_true")
     return parser.parse_args()
 
@@ -238,6 +242,7 @@ def init():
     cfg.gt_path = args.gt_path if args.gt_path else None
     cfg.models_info_path = args.models_info_path
     cfg.seed = args.seed if args.seed is not None else getattr(cfg, "rd_seed", 0)
+    cfg.n_hypotheses = max(1, args.n_hypotheses)
     cfg.skip_vsd = args.skip_vsd
     return cfg
 
@@ -467,91 +472,119 @@ def main():
         raise ValueError(f"Unknown precision mode: {precision_mode}")
 
     # -----------------------------------------------------------------------
-    # Feature Extraction
+    # Best-of-N hypotheses: re-sample templates/model points each pass, run
+    # FE + PEM, and keep the highest model-scored pose per instance.  The
+    # correct orientation reliably scores highest, so this selects it instead
+    # of a sampling-dependent 180-degree flip.
     # -----------------------------------------------------------------------
-    print(f"[OpenVINO] Extracting templates ({precision_mode})...")
     tem_path = os.path.join(cfg.output_dir, 'templates')
-    all_tem, all_tem_pts, all_tem_choose = get_templates_np(tem_path, cfg.test_dataset)
-
-    # rgb_input:    (42, 3, H, W)  — views as a true batch, no channel concat
-    # choose_input: (42, n_sample)  — per-view pixel choose indices
-    # pts_input:    (1, 42*n_sample, 3)
-    tem_rgb_concat    = np.stack(all_tem, axis=0).astype(np.float32)      # (42, 3, H, W)
-    tem_pts_concat    = np.concatenate(all_tem_pts, axis=1)               # (1, 210000, 3)
-    tem_choose_concat = np.stack(all_tem_choose, axis=0).astype(np.int64) # (42, 5000)
-
-    feature_inputs = {
-        "rgb_input": tem_rgb_concat,
-        "pts_input": tem_pts_concat,
-        "choose_input": tem_choose_concat
-    }
-
-    # Warm up — use an isolated InferRequest so its GPU BFYX-padded output
-    # tensors ([B,N,C,1]) are not cached in the compiled model's default
-    # request.  Reusing a request whose output tensor has shape [1,2048,3,1]
-    # against a port that expects [1,2048,3] raises a shape-mismatch error.
-    _warmup_req = ov_fe_compiled.create_infer_request()
-    _warmup_req.infer(feature_inputs)
-    del _warmup_req
-
-    time_start = time.time()
-    feature_results = ov_fe_compiled(feature_inputs)
-    results_list = _ordered_outputs(feature_results, ov_fe_compiled)
-    fe_time = time.time() - time_start
-    print(f"[OpenVINO] FE inference time: {fe_time * 1000:.2f} ms ({precision_mode})")
-
-    # GPU BFYX format pads 3-D gather outputs to 4-D [B,N,C,1]; squeeze it off.
-    all_tem_pts  = _squeeze_bfyx(results_list[0])   # (1, 2048, 3)
-    all_tem_feat = _squeeze_bfyx(results_list[1])   # (1, 2048, 256)
-
-    # -----------------------------------------------------------------------
-    # Pose Estimation
-    # -----------------------------------------------------------------------
-    print(f"[OpenVINO] Loading PEM input data...")
-    input_data, img, whole_pts, model_points, detections = get_test_data_np(
-        cfg.rgb_path, cfg.depth_path, cfg.cam_path, cfg.cad_path, cfg.seg_path,
-        cfg.det_score_thresh, cfg.test_dataset, cfg.topk_ism_score
-    )
-    ninstance = input_data['pts'].shape[0]
-    input_data['dense_po'] = np.repeat(all_tem_pts, ninstance, axis=0)
-    input_data['dense_fo'] = np.repeat(all_tem_feat, ninstance, axis=0)
-
-    # Warm up
-    warmup_end = min(cfg.max_batch_size, ninstance)
-    warmup_inputs = {k: input_data[k][0:warmup_end] for k in
-                     ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']}
-    _ = ov_pem_compiled(warmup_inputs)
-
-    # Batched inference
     batch_size = cfg.max_batch_size
-    all_R, all_t, all_score = [], [], []
-    total_pem_time = 0
+    n_hyp = cfg.n_hypotheses
+    print(f"[OpenVINO] Running {n_hyp} hypothesis pass(es) ({precision_mode})...")
 
-    for start in range(0, ninstance, batch_size):
-        end = min(start + batch_size, ninstance)
-        batch_inputs = {k: input_data[k][start:end] for k in
-                        ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']}
+    fe_time = 0.0
+    total_pem_time = 0.0
+    best_pose_scores = None
+    best_R = best_t = None
+    input_data = img = model_points = detections = None
 
-        pem_time_start = time.time()
-        results = ov_pem_compiled(batch_inputs)
-        pem_time = time.time() - pem_time_start
-        total_pem_time += pem_time
-        print(f"  Batch {start}:{end} PEM time: {pem_time * 1000:.2f} ms")
+    for hyp in range(n_hyp):
+        # --- Feature Extraction (template sampling varies per pass) ---
+        all_tem, all_tem_pts, all_tem_choose = get_templates_np(tem_path, cfg.test_dataset)
 
-        results_output = _ordered_outputs(results, ov_pem_compiled)
-        all_R.append(results_output[0])
-        all_t.append(results_output[1])
-        all_score.append(results_output[2])
+        # rgb_input:    (42, 3, H, W)  — views as a true batch, no channel concat
+        # choose_input: (42, n_sample)  — per-view pixel choose indices
+        # pts_input:    (1, 42*n_sample, 3)
+        tem_rgb_concat    = np.stack(all_tem, axis=0).astype(np.float32)      # (42, 3, H, W)
+        tem_pts_concat    = np.concatenate(all_tem_pts, axis=1)               # (1, 210000, 3)
+        tem_choose_concat = np.stack(all_tem_choose, axis=0).astype(np.int64) # (42, 5000)
 
-    ov_pred_R = np.concatenate(all_R, axis=0)
-    ov_pred_t = np.concatenate(all_t, axis=0)
-    ov_pred_pose_score = np.concatenate(all_score, axis=0)
+        feature_inputs = {
+            "rgb_input": tem_rgb_concat,
+            "pts_input": tem_pts_concat,
+            "choose_input": tem_choose_concat
+        }
 
-    pose_scores = ov_pred_pose_score * input_data['score']
-    pred_rot = ov_pred_R
-    pred_trans = ov_pred_t * 1000
+        if hyp == 0:
+            # Warm up — use an isolated InferRequest so its GPU BFYX-padded output
+            # tensors ([B,N,C,1]) are not cached in the compiled model's default
+            # request.  Reusing a request whose output tensor has shape [1,2048,3,1]
+            # against a port that expects [1,2048,3] raises a shape-mismatch error.
+            _warmup_req = ov_fe_compiled.create_infer_request()
+            _warmup_req.infer(feature_inputs)
+            del _warmup_req
 
-    print(f"\n[Summary] Precision={precision_mode}, Device={cfg.device}")
+        # Each pass runs FE on a fresh InferRequest: the GPU pads 3-D gather
+        # outputs to BFYX [B,N,C,1], and a reused request would carry that padded
+        # output tensor into the next pass and fail the port shape check.
+        fe_req = ov_fe_compiled.create_infer_request()
+        time_start = time.time()
+        feature_results = fe_req.infer(feature_inputs)
+        results_list = _ordered_outputs(feature_results, ov_fe_compiled)
+        fe_time += time.time() - time_start
+        del fe_req
+
+        # GPU BFYX format pads 3-D gather outputs to 4-D [B,N,C,1]; squeeze it off.
+        all_tem_pts  = _squeeze_bfyx(results_list[0])   # (1, 2048, 3)
+        all_tem_feat = _squeeze_bfyx(results_list[1])   # (1, 2048, 256)
+
+        # --- Pose Estimation (model-point sampling varies per pass) ---
+        input_data, img, whole_pts, model_points, detections = get_test_data_np(
+            cfg.rgb_path, cfg.depth_path, cfg.cam_path, cfg.cad_path, cfg.seg_path,
+            cfg.det_score_thresh, cfg.test_dataset, cfg.topk_ism_score
+        )
+        ninstance = input_data['pts'].shape[0]
+        input_data['dense_po'] = np.repeat(all_tem_pts, ninstance, axis=0)
+        input_data['dense_fo'] = np.repeat(all_tem_feat, ninstance, axis=0)
+
+        if hyp == 0:
+            # Warm up
+            warmup_end = min(cfg.max_batch_size, ninstance)
+            warmup_inputs = {k: input_data[k][0:warmup_end] for k in
+                             ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']}
+            _ = ov_pem_compiled(warmup_inputs)
+
+        # Batched inference
+        all_R, all_t, all_score = [], [], []
+        for start in range(0, ninstance, batch_size):
+            end = min(start + batch_size, ninstance)
+            batch_inputs = {k: input_data[k][start:end] for k in
+                            ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']}
+
+            pem_time_start = time.time()
+            results = ov_pem_compiled(batch_inputs)
+            total_pem_time += time.time() - pem_time_start
+
+            results_output = _ordered_outputs(results, ov_pem_compiled)
+            all_R.append(results_output[0])
+            all_t.append(results_output[1])
+            all_score.append(results_output[2])
+
+        ov_pred_R = np.concatenate(all_R, axis=0)
+        ov_pred_t = np.concatenate(all_t, axis=0)
+        ov_pred_pose_score = np.concatenate(all_score, axis=0)
+        hyp_pose_scores = ov_pred_pose_score * input_data['score']
+
+        # Keep the highest-scoring pose per instance across hypotheses.
+        if best_pose_scores is None:
+            best_pose_scores = hyp_pose_scores.copy()
+            best_R = ov_pred_R.copy()
+            best_t = ov_pred_t.copy()
+        else:
+            improved = hyp_pose_scores > best_pose_scores
+            best_pose_scores[improved] = hyp_pose_scores[improved]
+            best_R[improved] = ov_pred_R[improved]
+            best_t[improved] = ov_pred_t[improved]
+
+        if n_hyp > 1:
+            print(f"  [hyp {hyp + 1}/{n_hyp}] max score={hyp_pose_scores.max():.4f}  "
+                  f"best-so-far max={best_pose_scores.max():.4f}")
+
+    pose_scores = best_pose_scores
+    pred_rot = best_R
+    pred_trans = best_t * 1000
+
+    print(f"\n[Summary] Precision={precision_mode}, Device={cfg.device}, Hypotheses={n_hyp}")
     print(f"  FE time:    {fe_time * 1000:.2f} ms")
     print(f"  PEM time:   {total_pem_time * 1000:.2f} ms")
     print(f"  Total time: {(fe_time + total_pem_time) * 1000:.2f} ms")
