@@ -206,9 +206,9 @@ def get_parser():
                         help="RNG seed for deterministic template/model/observed point sampling "
                              "(default: rd_seed from config)")
     parser.add_argument("--n_hypotheses", type=int, default=1,
-                        help="Number of independent sampling+pose hypotheses to run; "
-                             "the highest model-scored pose is kept per instance. "
-                             "Mitigates sampling-dependent pose-flip ambiguity (default: 1)")
+                        help="Number of template-sampling hypotheses to run; the pose with the "
+                             "highest PEM score is kept per instance. 1 = single pass (default). "
+                             "Higher values stabilise near-symmetric objects against the 180-degree flip.")
     parser.add_argument("--skip_vsd", action="store_true")
     return parser.parse_args()
 
@@ -336,7 +336,16 @@ def get_test_data_np(rgb_path, depth_path, cam_path, cad_path, seg_path, det_sco
     whole_pts = get_point_cloud_from_depth(whole_depth, K)
 
     mesh = trimesh.load_mesh(cad_path)
-    model_points = mesh.sample(cfg.n_sample_model_point).astype(np.float32) / 1000.0
+    # Deterministic surface sampling (fixed RNG) so the model point set — and thus
+    # the predicted orientation — is reproducible and not subject to the random
+    # 180-degree flip on near-symmetric objects.
+    try:
+        model_points = mesh.sample(cfg.n_sample_model_point, seed=0).astype(np.float32) / 1000.0
+    except TypeError:
+        _rng_state = np.random.get_state()
+        np.random.seed(0)
+        model_points = mesh.sample(cfg.n_sample_model_point).astype(np.float32) / 1000.0
+        np.random.set_state(_rng_state)
     radius = np.max(np.linalg.norm(model_points, axis=1))
 
     all_rgb, all_cloud, all_rgb_choose, all_score, all_dets = [], [], [], [], []
@@ -472,32 +481,39 @@ def main():
         raise ValueError(f"Unknown precision mode: {precision_mode}")
 
     # -----------------------------------------------------------------------
-    # Best-of-N hypotheses: re-sample templates/model points each pass, run
-    # FE + PEM, and keep the highest model-scored pose per instance.  The
-    # correct orientation reliably scores highest, so this selects it instead
-    # of a sampling-dependent 180-degree flip.
+    # Load PEM data once — independent of template sampling
     # -----------------------------------------------------------------------
+    print(f"[OpenVINO] Loading PEM input data...")
     tem_path = os.path.join(cfg.output_dir, 'templates')
-    batch_size = cfg.max_batch_size
-    n_hyp = cfg.n_hypotheses
-    print(f"[OpenVINO] Running {n_hyp} hypothesis pass(es) ({precision_mode})...")
+    input_data, img, whole_pts, model_points, detections = get_test_data_np(
+        cfg.rgb_path, cfg.depth_path, cfg.cam_path, cfg.cad_path, cfg.seg_path,
+        cfg.det_score_thresh, cfg.test_dataset, cfg.topk_ism_score
+    )
+    ninstance = input_data['pts'].shape[0]
 
+    # Best-of-N over template sampling: each hypothesis re-samples the template
+    # points (random) -> FE -> PEM, and we keep the pose with the highest PEM
+    # score per instance. The correct pose scores higher than the 180-degree
+    # flip on near-symmetric objects, so this stabilises AR. N=1 == single pass.
+    best_R = np.zeros((ninstance, 3, 3), dtype=np.float32)
+    best_t = np.zeros((ninstance, 3), dtype=np.float32)
+    best_pose_score = np.full((ninstance,), -np.inf, dtype=np.float32)
     fe_time = 0.0
     total_pem_time = 0.0
-    best_pose_scores = None
-    best_R = best_t = None
-    input_data = img = model_points = detections = None
+    batch_size = cfg.max_batch_size
 
-    for hyp in range(n_hyp):
-        # --- Feature Extraction (template sampling varies per pass) ---
+    for hyp in range(cfg.n_hypotheses):
+        # -------------------------------------------------------------------
+        # Feature Extraction
+        # -------------------------------------------------------------------
         all_tem, all_tem_pts, all_tem_choose = get_templates_np(tem_path, cfg.test_dataset)
 
         # rgb_input:    (42, 3, H, W)  — views as a true batch, no channel concat
         # choose_input: (42, n_sample)  — per-view pixel choose indices
         # pts_input:    (1, 42*n_sample, 3)
-        tem_rgb_concat    = np.stack(all_tem, axis=0).astype(np.float32)      # (42, 3, H, W)
-        tem_pts_concat    = np.concatenate(all_tem_pts, axis=1)               # (1, 210000, 3)
-        tem_choose_concat = np.stack(all_tem_choose, axis=0).astype(np.int64) # (42, 5000)
+        tem_rgb_concat    = np.stack(all_tem, axis=0).astype(np.float32)
+        tem_pts_concat    = np.concatenate(all_tem_pts, axis=1)
+        tem_choose_concat = np.stack(all_tem_choose, axis=0).astype(np.int64)
 
         feature_inputs = {
             "rgb_input": tem_rgb_concat,
@@ -505,86 +521,58 @@ def main():
             "choose_input": tem_choose_concat
         }
 
-        if hyp == 0:
-            # Warm up — use an isolated InferRequest so its GPU BFYX-padded output
-            # tensors ([B,N,C,1]) are not cached in the compiled model's default
-            # request.  Reusing a request whose output tensor has shape [1,2048,3,1]
-            # against a port that expects [1,2048,3] raises a shape-mismatch error.
-            _warmup_req = ov_fe_compiled.create_infer_request()
-            _warmup_req.infer(feature_inputs)
-            del _warmup_req
-
-        # Each pass runs FE on a fresh InferRequest: the GPU pads 3-D gather
-        # outputs to BFYX [B,N,C,1], and a reused request would carry that padded
-        # output tensor into the next pass and fail the port shape check.
-        fe_req = ov_fe_compiled.create_infer_request()
+        # Use a fresh InferRequest so its GPU BFYX-padded output tensors
+        # ([B,N,C,1]) are not cached against a port expecting [1,2048,3].
         time_start = time.time()
+        fe_req = ov_fe_compiled.create_infer_request()
         feature_results = fe_req.infer(feature_inputs)
-        results_list = _ordered_outputs(feature_results, ov_fe_compiled)
+        results_list = [feature_results[p] for p in ov_fe_compiled.outputs]
         fe_time += time.time() - time_start
         del fe_req
 
-        # GPU BFYX format pads 3-D gather outputs to 4-D [B,N,C,1]; squeeze it off.
         all_tem_pts  = _squeeze_bfyx(results_list[0])   # (1, 2048, 3)
         all_tem_feat = _squeeze_bfyx(results_list[1])   # (1, 2048, 256)
-
-        # --- Pose Estimation (model-point sampling varies per pass) ---
-        input_data, img, whole_pts, model_points, detections = get_test_data_np(
-            cfg.rgb_path, cfg.depth_path, cfg.cam_path, cfg.cad_path, cfg.seg_path,
-            cfg.det_score_thresh, cfg.test_dataset, cfg.topk_ism_score
-        )
-        ninstance = input_data['pts'].shape[0]
         input_data['dense_po'] = np.repeat(all_tem_pts, ninstance, axis=0)
         input_data['dense_fo'] = np.repeat(all_tem_feat, ninstance, axis=0)
 
-        if hyp == 0:
-            # Warm up
-            warmup_end = min(cfg.max_batch_size, ninstance)
-            warmup_inputs = {k: input_data[k][0:warmup_end] for k in
-                             ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']}
-            _ = ov_pem_compiled(warmup_inputs)
-
-        # Batched inference
+        # ---------------------------------------------------------------
+        # Pose Estimation (batched)
+        # ---------------------------------------------------------------
         all_R, all_t, all_score = [], [], []
         for start in range(0, ninstance, batch_size):
             end = min(start + batch_size, ninstance)
             batch_inputs = {k: input_data[k][start:end] for k in
                             ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']}
-
             pem_time_start = time.time()
             results = ov_pem_compiled(batch_inputs)
             total_pem_time += time.time() - pem_time_start
-
             results_output = _ordered_outputs(results, ov_pem_compiled)
             all_R.append(results_output[0])
             all_t.append(results_output[1])
             all_score.append(results_output[2])
 
-        ov_pred_R = np.concatenate(all_R, axis=0)
-        ov_pred_t = np.concatenate(all_t, axis=0)
-        ov_pred_pose_score = np.concatenate(all_score, axis=0)
-        hyp_pose_scores = ov_pred_pose_score * input_data['score']
+        hyp_R = np.concatenate(all_R, axis=0)
+        hyp_t = np.concatenate(all_t, axis=0)
+        hyp_score = np.concatenate(all_score, axis=0)
 
         # Keep the highest-scoring pose per instance across hypotheses.
-        if best_pose_scores is None:
-            best_pose_scores = hyp_pose_scores.copy()
-            best_R = ov_pred_R.copy()
-            best_t = ov_pred_t.copy()
-        else:
-            improved = hyp_pose_scores > best_pose_scores
-            best_pose_scores[improved] = hyp_pose_scores[improved]
-            best_R[improved] = ov_pred_R[improved]
-            best_t[improved] = ov_pred_t[improved]
+        better = hyp_score > best_pose_score
+        best_R[better] = hyp_R[better]
+        best_t[better] = hyp_t[better]
+        best_pose_score[better] = hyp_score[better]
+        if cfg.n_hypotheses > 1:
+            print(f"  Hypothesis {hyp + 1}/{cfg.n_hypotheses}: "
+                  f"updated {int(better.sum())}/{ninstance} instances")
 
-        if n_hyp > 1:
-            print(f"  [hyp {hyp + 1}/{n_hyp}] max score={hyp_pose_scores.max():.4f}  "
-                  f"best-so-far max={best_pose_scores.max():.4f}")
+    ov_pred_R = best_R
+    ov_pred_t = best_t
+    ov_pred_pose_score = best_pose_score
 
-    pose_scores = best_pose_scores
-    pred_rot = best_R
-    pred_trans = best_t * 1000
+    pose_scores = ov_pred_pose_score * input_data['score']
+    pred_rot = ov_pred_R
+    pred_trans = ov_pred_t * 1000
 
-    print(f"\n[Summary] Precision={precision_mode}, Device={cfg.device}, Hypotheses={n_hyp}")
+    print(f"\n[Summary] Precision={precision_mode}, Device={cfg.device}, Hypotheses={cfg.n_hypotheses}")
     print(f"  FE time:    {fe_time * 1000:.2f} ms")
     print(f"  PEM time:   {total_pem_time * 1000:.2f} ms")
     print(f"  Total time: {(fe_time + total_pem_time) * 1000:.2f} ms")
