@@ -502,6 +502,26 @@ def main():
     total_pem_time = 0.0
     batch_size = cfg.max_batch_size
 
+    # Warm up FE and PEM once (excluded from timing) so the hypothesis-loop
+    # measurements reflect steady-state latency, not first-run compile/alloc
+    # cost. The isolated FE request also avoids caching a GPU BFYX-padded
+    # output tensor ([1,2048,3,1]) against a port expecting [1,2048,3].
+    _w_tem, _w_pts, _w_choose = get_templates_np(tem_path, cfg.test_dataset)
+    _w_inputs = {
+        "rgb_input": np.stack(_w_tem, axis=0).astype(np.float32),
+        "pts_input": np.concatenate(_w_pts, axis=1),
+        "choose_input": np.stack(_w_choose, axis=0).astype(np.int64),
+    }
+    _w_req = ov_fe_compiled.create_infer_request()
+    _w_res = _w_req.infer(_w_inputs)
+    _w_list = [_w_res[p] for p in ov_fe_compiled.outputs]
+    del _w_req
+    input_data['dense_po'] = np.repeat(_squeeze_bfyx(_w_list[0]), ninstance, axis=0)
+    input_data['dense_fo'] = np.repeat(_squeeze_bfyx(_w_list[1]), ninstance, axis=0)
+    _w_end = min(batch_size, ninstance)
+    _ = ov_pem_compiled({k: input_data[k][0:_w_end] for k in
+                         ['pts', 'rgb', 'rgb_choose', 'model', 'dense_po', 'dense_fo']})
+
     for hyp in range(cfg.n_hypotheses):
         # -------------------------------------------------------------------
         # Feature Extraction
