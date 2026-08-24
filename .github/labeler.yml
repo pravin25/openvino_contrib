@@ -2,53 +2,54 @@
 # SPDX-License-Identifier: Apache-2.0
 
 'category: CI':
-- '.github/**/*'
-- '.ci/**/*'
-- 'Jenkinsfile'
+  - '.github/**/*'
+  - '.ci/**/*'
+  - 'Jenkinsfile'
 
 'category: 3D':
-- 'modules/3d/**/*'
+  - 'modules/3d/**/*'
 
 'category: android demos':
-- 'modules/android_demos/**/*'
+  - 'modules/android_demos/**/*'
 
 'category: BEVFusion':
-- 'modules/openvino_bevfusion/**/*'
+  - 'modules/openvino_bevfusion/**/*'
 
 'category: custom operations':
-- 'modules/custom_operations/**/*'
+  - 'modules/custom_operations/**/*'
 
 'category: GenAI optimizations':
-- 'modules/genai_optimizations/**/*'
+  - 'modules/genai_optimizations/**/*'
 
 'category: java API':
-- 'modules/java_api/**/*'
+  - 'modules/java_api/**/*'
 
 'category: LangChain':
-- 'modules/openvino-langchain/**/*'
+  - 'modules/openvino-langchain/**/*'
 
 'category: llama.cpp plugin':
-- 'modules/llama_cpp_plugin/**/*'
+  - 'modules/llama_cpp_plugin/**/*'
 
 'category: NVIDIA plugin':
-- 'modules/nvidia_plugin/**/*'
+  - 'modules/nvidia_plugin/**/*'
 
 'category: Ollama':
-- 'modules/ollama_openvino/**/*'
+  - 'modules/ollama_openvino/**/*'
 
 'category: Token Merging':
-- 'modules/token_merging/**/*'
+  - 'modules/token_merging/**/*'
 
 'category: training kit':
-- 'modules/openvino_training_kit/**/*'
+  - 'modules/openvino_training_kit/**/*'
 
 'category: build':
-- '**/CMakeLists.txt'
-- '**/*.cmake'
+  - '**/CMakeLists.txt'
+  - '**/*.cmake'
 
 'dependencies':
-- '**/requirement*.txt'
-- '.gitmodules'
-- '**/setup.py'
-- any: ['**/thirdparty/**/*',
-        '!**/CMakeLists.txt']
+  - '**/requirement*.txt'
+  - '.gitmodules'
+  - '**/setup.py'
+  - any:
+      - '**/thirdparty/**/*'
+      - '!**/CMakeLists.txt'
